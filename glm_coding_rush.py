@@ -193,6 +193,7 @@ class APIInterceptor:
         # 按 URL 关键词分类存储
         self.endpoints: Dict[str, Dict] = {}
         self.detected_plan: Optional[str] = None
+        self.authorization: Optional[str] = None  # Bearer token
         self._playwright = None
         self._browser = None
         self._page = None
@@ -248,6 +249,9 @@ class APIInterceptor:
         # ── 核心: 从页面内部提取套餐配置（无需点击按钮） ──
         await self._scrape_plan_data()
 
+        # 提取 Authorization token（页面加载完通常已有匿名/缓存 token）
+        self.authorization = await self._extract_auth_token()
+
         # 打印捕获结果
         print(f"[Browser] 已拦截 {len(self.captured_requests)} 个 API 请求")
         for ep_name, ep_info in self.endpoints.items():
@@ -271,6 +275,91 @@ class APIInterceptor:
         print("=" * 60)
 
     # ── 页面数据提取 ────────────────────────────────
+
+    async def _extract_auth_token(self) -> Optional[str]:
+        """
+        关键修复：从 localStorage / sessionStorage / cookies 中提取 token，
+        用于在抢购阶段发 Authorization: Bearer <token> 头。
+
+        智谱的 API 不认 Cookie，所以光发 cookie 会被 1001 拒掉。
+        """
+        # JS 把所有 storage 里的键值都拿出来，再让 Python 选
+        extract_js = """
+        (() => {
+            const ls = {}, ss = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k) ls[k] = localStorage.getItem(k) || '';
+            }
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                if (k) ss[k] = sessionStorage.getItem(k) || '';
+            }
+            return JSON.stringify({localStorage: ls, sessionStorage: ss});
+        })()
+        """
+        try:
+            raw = await self._page.evaluate(extract_js)
+            storage = json.loads(raw) if raw else {}
+        except Exception as e:
+            print(f"[Browser] ⚠️ 读取 storage 失败: {e}", flush=True)
+            storage = {}
+
+        # 候选 token 键（按优先级）
+        token_keys = [
+            "token", "access_token", "authorization", "auth_token",
+            "user_token", "bigmodel_token", "glm_token", "jwt", "bearer",
+            "access-token", "x-auth-token",
+        ]
+
+        def score(key: str, value: str) -> int:
+            """给候选打分，分越高越像真的 token"""
+            if not value or len(value) < 16:
+                return -1
+            s = 0
+            lk = key.lower()
+            # JWT 通常以 ey 开头
+            if value.startswith("ey"):
+                s += 100
+            # 键名匹配
+            for i, k in enumerate(token_keys):
+                if k in lk:
+                    s += (len(token_keys) - i) * 5
+            # 长度合理（一般 > 50）
+            if len(value) > 50:
+                s += 10
+            elif len(value) > 20:
+                s += 5
+            return s
+
+        candidates: List[tuple] = []  # (score, source, value)
+        for k, v in (storage.get("localStorage") or {}).items():
+            sc = score(k, v)
+            if sc > 0:
+                candidates.append((sc, f"localStorage.{k}", v))
+        for k, v in (storage.get("sessionStorage") or {}).items():
+            sc = score(k, v)
+            if sc > 0:
+                candidates.append((sc, f"sessionStorage.{k}", v))
+        for ck, cv in self.captured_cookies.items():
+            sc = score(ck, cv)
+            if sc > 0:
+                candidates.append((sc, f"cookie.{ck}", cv))
+
+        if not candidates:
+            print("[Browser] ⚠️ 未找到 Authorization token ——"
+                  "抢购时会缺 Authorization 头", flush=True)
+            return None
+
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        best_score, best_source, best_value = candidates[0]
+        preview = best_value[:30] + "..." if len(best_value) > 30 else best_value
+        print(f"[Browser] 🔑 提取到 token (score={best_score}, 源={best_source}, "
+              f"长度={len(best_value)}, 前30={preview})", flush=True)
+        if best_score < 50:
+            print(f"[Browser] ⚠️ token 候选分较低 ({best_score})，可能选错，"
+                  f"请检查上面其他候选", flush=True)
+        return best_value
 
     async def _scrape_plan_data(self):
         """
@@ -699,6 +788,11 @@ class APIInterceptor:
             f"{k}={v}" for k, v in self.captured_cookies.items()
         )
 
+        # 登录后 token 通常才完整 —— 再提取一次
+        fresh_token = await self._extract_auth_token()
+        if fresh_token:
+            self.authorization = fresh_token
+
         print(f"\n[Browser] 更新后共 {len(self.captured_cookies)} 个 Cookie", flush=True)
         print(f"[Browser] 共拦截 {len(self.captured_requests)} 个 API 请求", flush=True)
         if self.endpoints:
@@ -746,6 +840,7 @@ class APIInterceptor:
             "target_plan": self.target_plan,
             "plan_metadata": getattr(self, "plan_metadata", {}),
             "plan_post_bodies": getattr(self, "plan_post_bodies", {}),
+            "authorization": self.authorization,  # Bearer token（关键）
         }
 
 
@@ -765,6 +860,7 @@ class RushEngine:
         detected_plan: Optional[str] = None,
         plan_metadata: Optional[Dict] = None,
         plan_post_bodies: Optional[Dict[str, str]] = None,
+        authorization: Optional[str] = None,
     ):
         self.cookie_str = cookie_str
         self.config = config
@@ -773,6 +869,7 @@ class RushEngine:
         self.detected_plan = detected_plan
         self.plan_metadata = plan_metadata or {}
         self.plan_post_bodies = plan_post_bodies or {}
+        self.authorization = authorization
 
         # ── 补齐缺失的端点（从已知模式推断） ──
         self._ensure_endpoints()
@@ -853,6 +950,9 @@ class RushEngine:
 
     def _build_client(self) -> httpx.AsyncClient:
         """构建带指纹伪装的 HTTP 客户端"""
+        # 关键修复：服务器要求 Authorization 头（cookie 单发会被 1001 拒）
+        auth_header = self._resolve_authorization_header()
+
         headers = {
             "accept": "application/json, text/plain, */*",
             "accept-language": random.choice([
@@ -877,6 +977,13 @@ class RushEngine:
             ).hexdigest()[:16],
             "x-timestamp": str(int(time.time() * 1000)),
         }
+        if auth_header:
+            headers["authorization"] = auth_header
+        else:
+            print("[Rush] ⚠️ 未配置 Authorization —— 几乎一定会被 1001 拒掉。\n"
+                  "       请先跑 --mode capture，登录后脚本会自动从 localStorage 提取 token",
+                  flush=True)
+
         return httpx.AsyncClient(
             headers=headers,
             timeout=httpx.Timeout(self.config.request_timeout),
@@ -884,6 +991,37 @@ class RushEngine:
             http2=True,
             follow_redirects=True,
         )
+
+    def _resolve_authorization_header(self) -> Optional[str]:
+        """
+        解析 Authorization 头的最终值。优先级：
+          1) 显式传入的 self.authorization
+          2) 捕获的 endpoint headers 里的 authorization
+          3) plan_metadata 里的 authorization
+        自动加 'Bearer ' 前缀（如果还没有）
+        """
+        candidates = []
+        if self.authorization:
+            candidates.append(self.authorization)
+        for ep in self.endpoints.values():
+            h = (ep or {}).get("headers") or {}
+            v = h.get("authorization") or h.get("Authorization")
+            if v:
+                candidates.append(v)
+        v = (self.plan_metadata or {}).get("authorization")
+        if v:
+            candidates.append(v)
+
+        for raw in candidates:
+            if not raw:
+                continue
+            s = str(raw).strip()
+            if not s:
+                continue
+            if s.lower().startswith("bearer "):
+                return s
+            return f"Bearer {s}"
+        return None
 
     async def _jitter_sleep(self, base_ms: int):
         """带抖动的异步等待"""
@@ -896,16 +1034,23 @@ class RushEngine:
     ) -> Optional[httpx.Response]:
         """发起单次请求，带重试"""
         try:
+            # 关键修复：把捕获的真实 headers 合并进来（覆盖默认 cookie/user-agent，
+            # 但保留 spoofed UA 和我们自己的 cookie/Authorization）
+            ep = self.endpoints.get(endpoint_name) or {}
+            captured_headers = (ep.get("headers") or {}) if isinstance(ep, dict) else {}
+            # 合并策略：captured 优先级最低（除了 authorization/cookie/ua），
+            # 我们的 session 默认 headers 已经设了 cookie + authorization + spoofed UA
+            per_call = {
+                "x-request-id": hashlib.md5(
+                    f"{time.time()}{random.random()}".encode()
+                ).hexdigest()[:16],
+            }
             if method == "POST":
                 resp = await self.session.post(
-                    url, content=data, headers={
-                        "x-request-id": hashlib.md5(
-                            f"{time.time()}{random.random()}".encode()
-                        ).hexdigest()[:16],
-                    }
+                    url, content=data, headers=per_call
                 )
             else:  # GET
-                resp = await self.session.get(url)
+                resp = await self.session.get(url, headers=per_call)
             return resp
         except Exception as e:
             self.stats["errors"] += 1
@@ -1231,6 +1376,7 @@ async def mode_rush(
     detected_plan: Optional[str] = None,
     plan_metadata: Optional[Dict] = None,
     plan_post_bodies: Optional[Dict[str, str]] = None,
+    authorization: Optional[str] = None,
 ):
     """抢购模式"""
     engine = RushEngine(
@@ -1240,6 +1386,7 @@ async def mode_rush(
         detected_plan=detected_plan,
         plan_metadata=plan_metadata,
         plan_post_bodies=plan_post_bodies,
+        authorization=authorization,
     )
 
     if dry_run:
@@ -1284,6 +1431,7 @@ async def mode_full(rush_config: RushConfig):
                 detected_plan=detected,
                 plan_metadata=saved.get("plan_metadata", {}),
                 plan_post_bodies=saved.get("plan_post_bodies", {}),
+                authorization=saved.get("authorization"),
             )
             return
 
@@ -1310,6 +1458,7 @@ async def mode_full(rush_config: RushConfig):
         detected_plan=saved.get("detected_plan"),
         plan_metadata=saved.get("plan_metadata", {}),
         plan_post_bodies=saved.get("plan_post_bodies", {}),
+        authorization=saved.get("authorization"),
     )
 
 
@@ -1416,6 +1565,7 @@ def main():
         detected_plan = None
         plan_metadata = None
         plan_post_bodies = None
+        authorization = None
         if not cookie_str:
             config = load_config()
             if config:
@@ -1424,11 +1574,18 @@ def main():
                 detected_plan = config.get("detected_plan")
                 plan_metadata = config.get("plan_metadata", {})
                 plan_post_bodies = config.get("plan_post_bodies", {})
+                authorization = config.get("authorization")
                 if cookie_str:
                     age = time.time() - CONFIG_FILE.stat().st_mtime
                     print(f"[Rush] 从配置文件加载 Cookie ({(age/60):.0f}分钟前)")
                     if detected_plan:
                         print(f"[Rush] 已保存的套餐: {PLANS.get(detected_plan, {}).get('name', detected_plan)}")
+                    if authorization:
+                        preview = authorization[:20] + "..." if len(authorization) > 20 else authorization
+                        print(f"[Rush] ✅ 已加载 Authorization token ({preview})", flush=True)
+                    else:
+                        print(f"[Rush] ⚠️ 配置文件中没有 Authorization token —— "
+                              f"请重新跑 --mode capture", flush=True)
 
         if not cookie_str:
             print("[ERROR] 请提供 Cookie: --cookie 'xxx' 或先运行 --mode capture")
@@ -1442,6 +1599,7 @@ def main():
             detected_plan=detected_plan,
             plan_metadata=plan_metadata,
             plan_post_bodies=plan_post_bodies,
+            authorization=authorization,
         ))
         return
 
