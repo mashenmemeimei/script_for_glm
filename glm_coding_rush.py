@@ -966,16 +966,21 @@ class RushEngine:
             "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
+            # 关键修复：补上现代浏览器 fetch 必带的 sec-fetch-* 头
+            # 缺这三个，CDN/WAF 会识别为非浏览器请求而挡掉（返回 405）
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-dest": "empty",
             "user-agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
-            # 随机请求指纹
+            # 随机请求指纹 —— x-timestamp 改为每次请求更新（之前是建 client 时一次，
+            # WAF 会把同一时间戳的请求当爬虫）
             "x-request-id": hashlib.md5(
                 f"{time.time()}{random.random()}".encode()
             ).hexdigest()[:16],
-            "x-timestamp": str(int(time.time() * 1000)),
         }
         if auth_header:
             headers["authorization"] = auth_header
@@ -984,13 +989,17 @@ class RushEngine:
                   "       请先跑 --mode capture，登录后脚本会自动从 localStorage 提取 token",
                   flush=True)
 
-        return httpx.AsyncClient(
+        # 把 client 存起来，让 _make_request 读取它的默认头
+        client = httpx.AsyncClient(
             headers=headers,
             timeout=httpx.Timeout(self.config.request_timeout),
             proxy=self.proxy,
             http2=True,
             follow_redirects=True,
         )
+        # 关键修复：把 auth 头单独缓存，方便 run() 打印
+        client._glm_auth = auth_header
+        return client
 
     def _resolve_authorization_header(self) -> Optional[str]:
         """
@@ -1034,16 +1043,13 @@ class RushEngine:
     ) -> Optional[httpx.Response]:
         """发起单次请求，带重试"""
         try:
-            # 关键修复：把捕获的真实 headers 合并进来（覆盖默认 cookie/user-agent，
-            # 但保留 spoofed UA 和我们自己的 cookie/Authorization）
-            ep = self.endpoints.get(endpoint_name) or {}
-            captured_headers = (ep.get("headers") or {}) if isinstance(ep, dict) else {}
-            # 合并策略：captured 优先级最低（除了 authorization/cookie/ua），
-            # 我们的 session 默认 headers 已经设了 cookie + authorization + spoofed UA
+            # 关键修复：每次请求都更新 x-timestamp / x-request-id，
+            # 避免 WAF 把同一时间戳的一波请求当爬虫
             per_call = {
                 "x-request-id": hashlib.md5(
                     f"{time.time()}{random.random()}".encode()
                 ).hexdigest()[:16],
+                "x-timestamp": str(int(time.time() * 1000)),
             }
             if method == "POST":
                 resp = await self.session.post(
@@ -1126,9 +1132,15 @@ class RushEngine:
                             pass
                     elif resp:
                         self.stats[f"preview_{resp.status_code}"] += 1
-                        # 调试：第一次失败时打印 body，立刻知道为什么
+                        # 调试：前 3 次失败时打印 body 摘要，立刻知道为什么
                         if debug_shown < 3:
-                            snippet = (resp.text or "")[:200]
+                            text = (resp.text or "")
+                            # 405 来自 WAF，body 是 HTML，只取 <title>
+                            if resp.status_code == 405 and "<title>" in text:
+                                m = re.search(r"<title>([^<]*)</title>", text)
+                                snippet = f"<WAF page title='{m.group(1) if m else '?'}'>"
+                            else:
+                                snippet = text[:120].replace("\n", " ")
                             print(f"[Rush] preview HTTP {resp.status_code}: {snippet}",
                                   flush=True)
                             self.stats["debug_shown"] = debug_shown + 1
@@ -1194,6 +1206,30 @@ class RushEngine:
         print(f"\n[Rush] 🔥 开火! {datetime.now(CST).strftime('%H:%M:%S.%f')[:-3]}", flush=True)
         plan = PLANS[self.config.plan]
         print(f"[Rush] 🎯 抢购套餐: {plan['name']} ({plan['price']}) — {plan['desc']}", flush=True)
+
+        # 关键诊断：打印实际使用的 URL 和 Authorization
+        preview_url = (self.endpoints.get("preview") or {}).get("url", "<missing>")
+        check_url = (self.endpoints.get("check") or {}).get("url", "<missing>")
+        pay_url = (self.endpoints.get("pay") or {}).get("url", "<missing>")
+        print(f"[Rush] 📡 端点 URL:", flush=True)
+        print(f"    preview: {preview_url}", flush=True)
+        print(f"    check:   {check_url}", flush=True)
+        print(f"    pay:     {pay_url}", flush=True)
+        # 标记 URL 是捕获的还是脚本猜的
+        for ep_name in ("preview", "check", "pay"):
+            ep = self.endpoints.get(ep_name) or {}
+            # 如果 headers 里有真实内容（来自浏览器），算"已捕获"
+            captured = bool(ep.get("headers"))
+            tag = "✅ 捕获" if captured else "⚠️  推断"
+            print(f"    [{tag}] {ep_name}", flush=True)
+
+        auth_header = getattr(self.session, "_glm_auth", None)
+        if auth_header:
+            preview = auth_header[:40] + ("..." if len(auth_header) > 40 else "")
+            print(f"[Rush] 🔑 Authorization: {preview} (length={len(auth_header)})", flush=True)
+        else:
+            print(f"[Rush] 🔑 Authorization: <未配置> ⚠️", flush=True)
+        print(f"[Rush] 🍪 Cookie 长度: {len(self.cookie_str)} 字符", flush=True)
         if self.detected_plan and self.detected_plan != self.config.plan:
             print(f"[Rush] ⚠️  警告: 捕获的套餐 ({PLANS[self.detected_plan]['name']}) "
                   f"与目标 ({plan['name']}) 不一致! —— 实际以用户指定 {plan['name']} 为准",
