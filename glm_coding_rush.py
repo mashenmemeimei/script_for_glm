@@ -54,27 +54,61 @@ TARGET_URL = "https://open.bigmodel.cn/glm-coding"
 BASE_URL = "https://open.bigmodel.cn"
 
 # ── 套餐定义 ──────────────────────────────────────────────
-# GLM Coding Plan 有三个套餐等级，每个套餐对应特定的 SKU/产品ID
+# GLM Coding Plan 有多个套餐变体：
+#   - 连续包月系列（个人订阅，强烈推荐） ← 默认目标
+#   - 年付 / 一次性（如果页面有的话）
 # 脚本通过 POST 请求体中的 productId / sku / planType 等字段区分套餐
 # 在捕获阶段，你点击哪个套餐的按钮，脚本就记录哪个套餐的参数
+#
+# 重要：套餐匹配顺序敏感 —— PLANS 字典的顺序就是检测优先级
+#       把 monthly_* 放前面，可以确保优先匹配"连续包月"变体
 PLANS = {
-    "lite": {
-        "name": "Lite",
+    # ── 连续包月套餐（个人订阅，⭐ 默认目标） ──
+    "monthly_lite": {
+        "name": "个人连续包月 Lite",
         "price": "¥49/月",
-        "desc": "基础套餐 - 适合个人开发者 / 小型项目",
-        # 以下是请求体中可能出现的套餐标识关键词（用于自动检测）
+        "desc": "个人套餐 - 连续包月 Lite（基础，¥49/月）",
+        "keywords": [
+            # 强：含下划线 / CJK+English 混合
+            "monthly_lite", "personal_monthly_lite", "连续包月_lite",
+            "连续包月lite", "个人连续包月lite", "个人lite",
+        ],
+    },
+    "monthly_pro": {
+        "name": "个人连续包月 Pro",
+        "price": "¥149/月",
+        "desc": "个人套餐 - 连续包月 Pro（5倍额度，¥149/月）",
+        "keywords": [
+            "monthly_pro", "personal_monthly_pro", "连续包月_pro",
+            "连续包月pro", "个人连续包月pro", "个人pro",
+        ],
+    },
+    "monthly_max": {
+        "name": "个人连续包月 Max",
+        "price": "¥469/月",
+        "desc": "个人套餐 - 连续包月 Max（20倍额度，¥469/月）",
+        "keywords": [
+            "monthly_max", "personal_monthly_max", "连续包月_max",
+            "连续包月max", "个人连续包月max", "个人max",
+        ],
+    },
+    # ── 兼容旧版（不指定周期，可能误匹配年付/一次性） ──
+    "lite": {
+        "name": "Lite（兼容旧版）",
+        "price": "¥49/月",
+        "desc": "基础套餐（兼容旧版）—— 慎用，可能匹配到年付/一次性",
         "keywords": ["lite", "basic", "standard", "coding_lite", "glm_coding_lite"],
     },
     "pro": {
-        "name": "Pro",
+        "name": "Pro（兼容旧版）",
         "price": "¥149/月",
-        "desc": "专业套餐 - 5倍额度 / GLM-5 优先 / 中大型项目",
+        "desc": "专业套餐（兼容旧版）",
         "keywords": ["pro", "professional", "coding_pro", "glm_coding_pro"],
     },
     "max": {
-        "name": "Max",
+        "name": "Max（兼容旧版）",
         "price": "¥469/月",
-        "desc": "旗舰套餐 - 20倍额度 / 最高并发优先级",
+        "desc": "旗舰套餐（兼容旧版）",
         "keywords": ["max", "ultimate", "coding_max", "glm_coding_max"],
     },
 }
@@ -95,13 +129,16 @@ class RushConfig:
     plan: str = "lite"                # 目标套餐: lite / pro / max
 
     # 并发引擎
-    burst_concurrency: int = 10       # 前 N 秒高并发数
-    normal_concurrency: int = 5       # 普通并发数
+    # ⭐ 关键修复：降低并发避免 WAF 拦截
+    # 原 10/5 触发 WAF 速率限制 → 99% 请求被 405
+    burst_concurrency: int = 3        # 前 N 秒高并发数（原 10，WAF 会被封）
+    normal_concurrency: int = 2       # 普通并发数（原 5）
     burst_duration: float = 5.0       # 高并发持续秒数
     max_retries: int = 600            # 普通阶段最大重试秒数（默认 10 分钟，原 2000=33 分钟太夸张）
 
     # 间隔策略 (ms)
-    burst_count: int = 20             # 前 N 次零延迟爆发
+    # ⭐ 关键修复：减少零延迟爆发次数，避免瞬间触发 WAF
+    burst_count: int = 10             # 前 N 次零延迟爆发（原 20）
     fast_interval_ms: int = 30        # 快速重试间隔
     slow_interval_ms: int = 100       # 慢速重试间隔
     jitter_pct: float = 0.30          # 间隔随机抖动比例
@@ -647,26 +684,46 @@ class APIInterceptor:
         """
         严格匹配套餐关键词，避免 "max" 误命中 "maxAge" / "maximize" / "elite套餐"。
 
-        - 强关键词（带下划线如 glm_coding_lite）：用 ASCII 字母边界 (?<![a-zA-Z])...(?![a-zA-Z])
-          （用 ASCII 边界而非 \\b 是因为 CJK 字符在 Python re Unicode 模式下属于 \\w，会破坏 \\b 语义）
-        - 弱关键词（如 lite/max/pro/basic）：必须紧邻 plan/package/套餐/订阅 上下文，
-          且关键词本身也用 ASCII 字母边界 —— 这样 "elite套餐" 里的 "lite" 不会被误命中
+        关键改进（支持 "连续包月 Lite" / "连续包月Lite" / "连续包月_Lite" 多种写法）：
+          - 归一化：文本和关键词都去除空白 / 下划线 / 破折号
+          - 强关键词：含 _ / - / 同时含 CJK 和英文（不需要上下文），
+            例如 "monthly_lite" / "连续包月_lite" / "连续包月lite" / "个人连续包月lite"
+          - 弱关键词：纯英文短词（lite/max/pro/basic）必须紧邻上下文
+            （plan/package/product/套餐/订阅/包月/个人）
+
+        边界说明：用 ASCII 字母边界 (?<![a-zA-Z])...(?![a-zA-Z]) 而非 \\b，
+        因为 CJK 字符在 Python re Unicode 模式下属于 \\w，会破坏 \\b 语义。
         """
-        text = text_lower
-        url = url_lower
-        # 强关键词
+        def norm(s: str) -> str:
+            """归一化：去除空白、下划线、破折号（处理多种排版格式）"""
+            return re.sub(r'[\s_\-]+', '', s)
+
+        def is_mixed(s: str) -> bool:
+            """是否是 CJK+English 混合关键词（如 "连续包月lite"）"""
+            has_cjk = any('一' <= c <= '鿿' for c in s)
+            has_eng = any(c.isascii() and c.isalpha() for c in s)
+            return has_cjk and has_eng
+
+        text = norm(text_lower)
+        url = norm(url_lower)
+
+        # ── 强关键词：含 _ / - / CJK+English 混合 ──
         for kw in plan_info["keywords"]:
-            if "_" not in kw:
+            if not ("_" in kw or "-" in kw or is_mixed(kw)):
                 continue
-            pat = rf"(?<![a-zA-Z]){re.escape(kw)}(?![a-zA-Z])"
+            norm_kw = norm(kw)
+            pat = rf"(?<![a-zA-Z]){re.escape(norm_kw)}(?![a-zA-Z])"
             if re.search(pat, text) or re.search(pat, url):
                 return True
-        # 弱关键词 + 上下文
-        contexts = (r"\bplan\b", r"\bpackage\b", r"\bproduct\b", "套餐", "订阅")
+
+        # ── 弱关键词：纯英文短词 + 上下文 ──
+        # 上下文新增 "包月" / "个人"，便于 monthly_* 套餐的弱关键词也能被识别
+        contexts = (r"\bplan\b", r"\bpackage\b", r"\bproduct\b", "套餐", "订阅", "包月", "个人")
         for kw in plan_info["keywords"]:
-            if "_" in kw:
-                continue
-            kw_pat = rf"(?<![a-zA-Z]){re.escape(kw)}(?![a-zA-Z])"
+            if "_" in kw or "-" in kw or is_mixed(kw):
+                continue  # 已在强匹配中处理
+            norm_kw = norm(kw)
+            kw_pat = rf"(?<![a-zA-Z]){re.escape(norm_kw)}(?![a-zA-Z])"
             for ctx in contexts:
                 if re.search(rf"{ctx}.*{kw_pat}|{kw_pat}.*{ctx}", text, re.DOTALL):
                     return True
@@ -714,18 +771,25 @@ class APIInterceptor:
                 break
 
         if not matched:
-            # 兜底：按路径关键词匹配
-            for name in ["preview", "check", "pay", "subscribe", "plan"]:
-                if name in path.lower():
-                    key = name if name != "subscribe" else "preview"
-                    if key not in self.endpoints:
-                        self.endpoints[key] = {
+            # ⭐ 关键修复：用精确路径模式匹配，避免 "whitelist/check" 被误判为订单 check
+            # 顺序重要：更具体的先匹配
+            ORDER_PATHS = (
+                ("preview", ("/api/biz/pay/batch-preview", "/api/coding-plan/subscribe/preview")),
+                ("check",   ("/api/coding-plan/subscribe/check",)),
+                ("pay",     ("/api/coding-plan/subscribe/pay",)),
+            )
+            for name, patterns in ORDER_PATHS:
+                if name in self.endpoints:
+                    continue
+                for pat in patterns:
+                    if pat in url:
+                        self.endpoints[name] = {
                             "url": url,
                             "method": method,
                             "headers": headers,
                             "post_data": post_data,
                         }
-                    break
+                        break
 
         # 全量记录
         if len(self.captured_requests) <= 30:
@@ -774,9 +838,13 @@ class APIInterceptor:
         target_name = PLANS[self.target_plan]['name']
         print("\n" + "-" * 40)
         print(f"[Browser] 1. 如果尚未登录，请先在浏览器中完成登录")
-        print(f"[Browser] 2. ⭐ 在套餐卡片上点击 [{target_name}] 的「订阅/购买」按钮")
-        print(f"[Browser]    （售罄时弹窗会提示，但请求已被脚本拦截，可直接关闭弹窗）")
-        print(f"[Browser] 3. 完成后回到终端，按 Enter 继续...")
+        print(f"[Browser] 2. ⭐ 找到 [{target_name}] 套餐卡片")
+        print(f"[Browser] 3. ⭐ 如果订阅按钮可点击：点一下「订阅/购买」")
+        print(f"[Browser]    （弹窗显示售罄也无所谓，请求依然会被脚本拦截）")
+        print(f"[Browser]    如果弹出支付确认页/二维码，务必点「确认/下一步」")
+        print(f"[Browser]    如果按钮是灰色「人数过多/排队中」：不用动")
+        print(f"[Browser]    —— 按 Enter 后脚本会自动强制触发，绕过 disabled 状态")
+        print(f"[Browser] 4. 完成后回到终端，按 Enter 继续...")
         print("-" * 40)
         input()  # 阻塞等待 Enter
 
@@ -795,8 +863,34 @@ class APIInterceptor:
 
         print(f"\n[Browser] 更新后共 {len(self.captured_cookies)} 个 Cookie", flush=True)
         print(f"[Browser] 共拦截 {len(self.captured_requests)} 个 API 请求", flush=True)
+
+        # ⭐ 关键修复：如果 check/pay 端点还没抓到（按钮是灰色的常见情况），
+        # 自动尝试强制触发，绕过 disabled 状态
+        if 'check' not in self.endpoints or 'pay' not in self.endpoints:
+            print(f"\n[Browser] ⭐ 未检测到 check/pay 端点，尝试强制触发 {target_name} 订阅...",
+                  flush=True)
+            force_result = await self.force_subscribe_attempt()
+            if force_result.get('newEndpoints'):
+                print(f"[Browser] ✅ 强制触发成功，新增 {len(force_result['newEndpoints'])} 个端点:",
+                      flush=True)
+                for k, v in force_result['newEndpoints'].items():
+                    print(f"    - {k}: ...{v[-60:]}", flush=True)
+            else:
+                tb = force_result.get('targetButton') or {}
+                print(f"[Browser] ⚠️  强制触发未捕获新端点:", flush=True)
+                print(f"    按钮文字: {tb.get('text', '(未找到)')}", flush=True)
+                print(f"    按钮状态: disabled={tb.get('disabled', '?')}", flush=True)
+                print(f"    尝试方法: {force_result.get('attempts', [])}", flush=True)
+                if force_result.get('modalsFound'):
+                    print(f"    弹窗: {len(force_result['modalsFound'])} 个（可能需手动点弹窗内按钮）",
+                          flush=True)
+                if force_result.get('errors'):
+                    print(f"    错误: {force_result['errors'][:3]}", flush=True)
+        else:
+            print(f"[Browser] ✅ 已捕获 check 和 pay 端点，无需强制触发", flush=True)
+
         if self.endpoints:
-            print(f"[Browser] 识别到 {len(self.endpoints)} 个关键端点:", flush=True)
+            print(f"\n[Browser] 识别到 {len(self.endpoints)} 个关键端点:", flush=True)
             for name, ep in self.endpoints.items():
                 print(f"  - {name}: {ep['method']} ...{ep['url'][-50:]}", flush=True)
         else:
@@ -822,6 +916,154 @@ class APIInterceptor:
             for pk, body in self.plan_post_bodies.items():
                 marker = " ← 目标" if pk == self.target_plan else ""
                 print(f"  - {pk}{marker}: {body[:120]}", flush=True)
+
+    async def force_subscribe_attempt(self) -> Dict:
+        """
+        强制触发订阅流程（绕过 disabled 状态）。
+        用于「人数过多/售罄」等按钮被禁用的场景 —— 用户没法点击，但 JS 拦截器
+        还是能从页面的 click handler / fetch 调用里捕获真实 URL。
+        返回 {targetButton, clicked, attempts, errors, newEndpoints, modalsFound}
+        """
+        target_name = PLANS[self.target_plan]['name']
+        endpoints_before = {k: v.get('url', '') for k, v in self.endpoints.items()}
+
+        # ── 1. JS 找按钮 + 解除 disabled + 多种方式触发 ──
+        js = """
+        (targetPlan) => {
+            const result = {
+                targetButton: null,
+                clicked: false,
+                attempts: [],
+                errors: []
+            };
+
+            // 找到目标套餐卡片
+            const allEls = Array.from(document.querySelectorAll('*'));
+            let planCard = null;
+            for (const el of allEls) {
+                const txt = (el.textContent || '');
+                if (txt.length < 5 || txt.length > 3000) continue;
+                if (!txt.includes(targetPlan)) continue;
+                if (!(txt.includes('¥') || txt.includes('月') || txt.includes('年'))) continue;
+                const card = el.closest('[class*="card" i], [class*="plan" i], [class*="item" i]') || el;
+                if (card.offsetHeight > 50 && card.offsetHeight < 1500) {
+                    planCard = card;
+                    break;
+                }
+            }
+            if (!planCard) {
+                result.errors.push('未找到套餐卡片');
+                return result;
+            }
+
+            // 在卡片内找按钮（包括灰色禁用按钮）
+            const btns = planCard.querySelectorAll('button, a, [role="button"], [class*="btn" i]');
+            for (const btn of btns) {
+                const txt = (btn.textContent || '').trim();
+                if (txt.length < 1 || txt.length > 30) continue;
+                const isTarget = txt.includes('订阅') || txt.includes('购买') ||
+                                txt.includes('立即') || txt.includes('开通') ||
+                                txt.includes('Subscribe') || txt.includes('Buy') ||
+                                txt.includes('抢') || txt.includes('人数') ||
+                                txt.includes('售罄') || txt.includes('已抢') ||
+                                txt.includes('排队');
+                if (!isTarget) continue;
+
+                result.targetButton = {
+                    text: txt.substring(0, 30),
+                    tagName: btn.tagName,
+                    className: (btn.className || '').toString().substring(0, 80),
+                    disabled: !!btn.disabled,
+                };
+
+                // 解除禁用
+                try { btn.disabled = false; } catch (e) {}
+                btn.removeAttribute('disabled');
+                btn.removeAttribute('aria-disabled');
+                btn.style.pointerEvents = 'auto';
+                btn.style.opacity = '1';
+                btn.style.cursor = 'pointer';
+
+                // 多种方式触发（覆盖原生 + React + 通用事件）
+                try { btn.click(); result.attempts.push('native_click'); result.clicked = true; }
+                catch (e) { result.errors.push('native_click: ' + e); }
+
+                try {
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                    result.attempts.push('mouseevent');
+                } catch (e) { result.errors.push('mouseevent: ' + e); }
+
+                // React onClick 属性（绕过 React 的 disabled 拦截）
+                const reactKey = Object.keys(btn).find(k => k.startsWith('__reactProps'));
+                if (reactKey) {
+                    try {
+                        const props = btn[reactKey];
+                        if (props && typeof props.onClick === 'function') {
+                            props.onClick({
+                                preventDefault: () => {}, stopPropagation: () => {},
+                                currentTarget: btn, target: btn,
+                            });
+                            result.attempts.push('react_onClick');
+                        }
+                    } catch (e) { result.errors.push('react: ' + e); }
+                }
+
+                break;  // 只处理第一个匹配的按钮
+            }
+
+            if (!result.targetButton) {
+                result.errors.push('套餐卡片内未找到任何按钮');
+            }
+            return result;
+        }
+        """
+
+        try:
+            result = await self._page.evaluate(js, target_name)
+        except Exception as e:
+            return {"targetButton": None, "clicked": False, "attempts": [],
+                    "errors": [f"evaluate 失败: {e}"], "newEndpoints": {}}
+
+        # ── 2. 等待 3 秒让 API 请求发出 ──
+        await asyncio.sleep(3)
+
+        # ── 3. 检查是否弹出新模态框（强制点击可能触发了弹窗） ──
+        modal_js = """
+        (() => {
+            const modals = document.querySelectorAll(
+                '[class*="modal" i], [class*="dialog" i], [class*="popup" i], ' +
+                '[role="dialog"], [class*="drawer" i]'
+            );
+            const visible = [];
+            for (const m of modals) {
+                const style = window.getComputedStyle(m);
+                const rect = m.getBoundingClientRect();
+                if (style.display !== 'none' && style.visibility !== 'hidden' &&
+                    parseFloat(style.opacity) > 0 && rect.width > 0 && rect.height > 0) {
+                    visible.push({
+                        text: (m.textContent || '').trim().substring(0, 100),
+                        className: (m.className || '').toString().substring(0, 60)
+                    });
+                }
+            }
+            return JSON.stringify(visible);
+        })()
+        """
+        try:
+            modals_str = await self._page.evaluate(modal_js)
+            modals = json.loads(modals_str) if modals_str else []
+        except Exception:
+            modals = []
+        result['modalsFound'] = modals
+
+        # ── 4. 检查新增端点 ──
+        new_endpoints = {}
+        for k, v in self.endpoints.items():
+            if k not in endpoints_before or endpoints_before[k] != v.get('url', ''):
+                new_endpoints[k] = v.get('url', '')
+        result['newEndpoints'] = new_endpoints
+
+        return result
 
     async def close(self):
         if self._browser:
@@ -888,6 +1130,16 @@ class RushEngine:
 
     def _ensure_endpoints(self):
         """如果网络捕获阶段没有拦截到 API 端点，从已知模式推断"""
+        # ⭐ 关键修复：丢弃误抓的 whitelist 端点（不是订单接口，是页面初次加载时的功能白名单查询）
+        dropped = []
+        for ep_name in list(self.endpoints.keys()):
+            url = self.endpoints[ep_name].get("url", "").lower()
+            if "whitelist" in url or "/label/" in url:
+                dropped.append(ep_name)
+                del self.endpoints[ep_name]
+        if dropped:
+            print(f"[Rush] ⚠️  丢弃误抓端点（白名单接口，不是订单接口）: {dropped}", flush=True)
+
         # 注意：base 只到 host，后面拼 "/api/..." 时不要再带 /api 前缀
         observed_api_base = BASE_URL
         for ep in self.endpoints.values():
@@ -1144,8 +1396,15 @@ class RushEngine:
                             print(f"[Rush] preview HTTP {resp.status_code}: {snippet}",
                                   flush=True)
                             self.stats["debug_shown"] = debug_shown + 1
+                        # ⭐ 关键修复：405 = WAF 拦截，强制退避 2~5 秒
+                        # 否则 WAF 会把整段 IP 拉黑，连正确的请求也打不出去
+                        if resp.status_code == 405:
+                            backoff = random.uniform(2.0, 5.0)
+                            await asyncio.sleep(backoff)
                     else:
                         self.stats["preview_no_resp"] += 1
+                        # ⭐ 关键修复：连接超时/拒绝时也退避 1~3 秒，避免空转
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
 
                 return False
 
@@ -1498,58 +1757,349 @@ async def mode_full(rush_config: RushConfig):
     )
 
 
+# ============================================================================
+# 手动抓包模式（绕开 Playwright capture 阶段）
+# ============================================================================
+
+async def mode_build_config(
+    config_input: str = "",
+    cookie: str = "",
+    authorization: str = "",
+    product_id: str = "",
+    preview_url: str = "",
+    check_url: str = "",
+    pay_url: str = "",
+    preview_curl: str = "",
+    check_curl: str = "",
+    pay_curl: str = "",
+    plan: str = "monthly_lite",
+    print_template: bool = False,
+):
+    """
+    从手动 F12 抓包数据构造 config.json（完全绕开 Playwright capture 阶段）。
+
+    适用场景：
+      - 智谱页面被 WAF 软封（Playwright 启动的浏览器也通不过 antidom.js）
+      - 用户用真实浏览器（Edge/Chrome）手动 F12 抓包
+      - 想精确控制 WAF 令牌 (decode__1570) 的时效
+
+    用法：
+      1) 打印模板到屏幕（方便复制）：
+         python glm_coding_rush.py --mode build-config --print-template
+
+      2) 生成模板文件到 ~/.glm_rush/manual_capture.json（首次使用推荐）：
+         python glm_coding_rush.py --mode build-config
+         编辑模板填入抓包数据
+
+      3) 用 JSON 文件构造配置：
+         python glm_coding_rush.py --mode build-config --config-input ~/.glm_rush/manual_capture.json
+
+      4) 用 cURL 命令（从 DevTools → Copy as cURL 复制）：
+         python glm_coding_rush.py --mode build-config --preview-curl "curl '...' -H '...' ..."
+
+      5) 用单独的 CLI 参数：
+         python glm_coding_rush.py --mode build-config \\
+             --cookie "..." --authorization "Bearer ..." --product-id "abc" \\
+             --preview-url "https://...?decode__1570=..." \\
+             --check-url "https://...?decode__1570=..."
+    """
+    print("=" * 60)
+    print("🎯 手动抓包配置构造器 (Manual Capture Builder)")
+    print("=" * 60)
+    print()
+
+    # ── cURL 解析器 ──
+    def parse_curl(curl_text: str) -> Dict:
+        """从 DevTools 复制的 cURL 命令解析 URL、headers、body"""
+        result = {"url": "", "headers": {}, "data": ""}
+        if not curl_text:
+            return result
+        # URL
+        url_match = re.search(r"curl\s+['\"]?(https?://[^\s'\"]+)", curl_text)
+        if url_match:
+            result["url"] = url_match.group(1)
+        # Headers (-H 'key: value' / -H "key: value")
+        # ⭐ 关键：用 '[^']*' 而不是 ['"](.+?)['"]，避免 body 内的双引号被字符类匹配
+        for h_match in re.finditer(
+            r"""(?:-H|--header)\s+(?:"([^"]*)"|'([^']*)')""", curl_text
+        ):
+            raw = h_match.group(1) or h_match.group(2) or ""
+            if ":" in raw:
+                key, value = raw.split(":", 1)
+                result["headers"][key.strip().lower()] = value.strip()
+        # Body (--data-raw / --data / -d)
+        # ⭐ 关键：必须配对引号（同种引号开闭），不能混用
+        for flag in ("--data-raw", "--data", "-d"):
+            # 单引号包裹
+            m = re.search(rf"{re.escape(flag)}\s+'([^']*)'", curl_text, re.DOTALL)
+            if not m:
+                # 双引号包裹
+                m = re.search(rf'{re.escape(flag)}\s+"([^"]*)"', curl_text, re.DOTALL)
+            if m:
+                result["data"] = m.group(1)
+                break
+        return result
+
+    # ── 1. 加载数据：JSON 文件 → cURL → CLI（后者覆盖前者） ──
+    if config_input:
+        input_path = Path(config_input)
+        if not input_path.exists():
+            print(f"[BuildConfig] ❌ 文件不存在: {config_input}")
+            return
+        try:
+            with open(input_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[BuildConfig] ❌ JSON 解析失败: {e}")
+            return
+        cookie = cookie or data.get("cookie", "")
+        authorization = authorization or data.get("authorization", "")
+        product_id = product_id or data.get("productId", "")
+        endpoints_in = data.get("endpoints", {})
+        preview_url = preview_url or endpoints_in.get("preview", {}).get("url", "")
+        check_url = check_url or endpoints_in.get("check", {}).get("url", "")
+        pay_url = pay_url or endpoints_in.get("pay", {}).get("url", "")
+        # 支持 cURL_commands 字段（粘 DevTools 的 Copy as cURL）
+        curl_cmds = data.get("curl_commands", {})
+        if curl_cmds.get("preview"):
+            p = parse_curl(curl_cmds["preview"])
+            preview_url = preview_url or p["url"]
+            cookie = cookie or p["headers"].get("cookie", "")
+            authorization = authorization or p["headers"].get("authorization", "")
+            if not product_id and p["data"]:
+                try:
+                    product_id = json.loads(p["data"]).get("productId", "")
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        if curl_cmds.get("check"):
+            check_url = check_url or parse_curl(curl_cmds["check"])["url"]
+        if curl_cmds.get("pay"):
+            pay_url = pay_url or parse_curl(curl_cmds["pay"])["url"]
+
+    # 处理 cURL CLI 参数
+    if preview_curl:
+        p = parse_curl(preview_curl)
+        preview_url = preview_url or p["url"]
+        cookie = cookie or p["headers"].get("cookie", "")
+        authorization = authorization or p["headers"].get("authorization", "")
+        if not product_id and p["data"]:
+            try:
+                product_id = json.loads(p["data"]).get("productId", "")
+            except (json.JSONDecodeError, KeyError):
+                pass
+    if check_curl:
+        check_url = check_url or parse_curl(check_curl)["url"]
+    if pay_curl:
+        pay_url = pay_url or parse_curl(pay_curl)["url"]
+
+    # ── 2. 打印模板或写入模板文件 ──
+    template = {
+        "_说明": "推荐用 curl_commands 字段：DevTools 请求 → 右键 → Copy → Copy as cURL (bash)，粘到下面",
+        "curl_commands": {
+            "preview": "curl 'https://open.bigmodel.cn/api/biz/pay/batch-preview?decode__1570=YOUR_WAF_TOKEN' \\\n  -H 'authorization: Bearer YOUR_JWT_TOKEN' \\\n  -H 'cookie: YOUR_FULL_COOKIE_STRING' \\\n  -H 'content-type: application/json' \\\n  --data-raw '{\"productId\":\"YOUR_PRODUCT_ID\"}'",
+            "check": "curl 'https://open.bigmodel.cn/api/coding-plan/subscribe/check?decode__1570=YOUR_WAF_TOKEN' \\\n  -H 'authorization: Bearer YOUR_JWT_TOKEN' \\\n  -H 'cookie: YOUR_FULL_COOKIE_STRING' \\\n  --data-raw '{\"productId\":\"YOUR_PRODUCT_ID\"}'",
+            "pay": "curl 'https://open.bigmodel.cn/api/coding-plan/subscribe/pay?decode__1570=YOUR_WAF_TOKEN' \\\n  -H 'authorization: Bearer YOUR_JWT_TOKEN' \\\n  -H 'cookie: YOUR_FULL_COOKIE_STRING' \\\n  --data-raw '{\"productId\":\"YOUR_PRODUCT_ID\"}'"
+        },
+        "_或直接填字段": "如果不想用 cURL 模式，填下面的字段",
+        "cookie": "",
+        "authorization": "",
+        "productId": "",
+        "endpoints": {
+            "preview": {"url": ""},
+            "check": {"url": ""},
+            "pay": {"url": ""}
+        }
+    }
+
+    if print_template:
+        print("📋 配置模板:")
+        print()
+        print(json.dumps(template, indent=2, ensure_ascii=False))
+        print()
+        print("=" * 60)
+        return
+
+    if not any([cookie, preview_url, preview_curl, check_curl, pay_curl, config_input]):
+        template_path = CONFIG_DIR / "manual_capture.json"
+        template_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(template_path, "w", encoding="utf-8") as f:
+            json.dump(template, f, indent=2, ensure_ascii=False)
+        print(f"📝 模板已写入: {template_path}")
+        print()
+        print("👉 编辑该文件，把 cURL 命令粘贴到 curl_commands 字段，然后运行:")
+        print(f"   python glm_coding_rush.py --mode build-config --config-input {template_path}")
+        print()
+        print("💡 如何获取 cURL:")
+        print("   1. 浏览器（用 4G 热点避开 WAF）打开 https://open.bigmodel.cn/glm-coding")
+        print("   2. F12 → Network → 勾上 Preserve log → 刷新页面")
+        print("   3. 登录后点击 Lite 套餐的「订阅」按钮")
+        print("   4. 找到以下请求，右键 → Copy → Copy as cURL (bash):")
+        print("      - /api/biz/pay/batch-preview (preview) ← 必须有")
+        print("      - /api/coding-plan/subscribe/check (check) ← 关键（订单校验）")
+        print("      - /api/coding-plan/subscribe/pay (pay) ← 关键（支付链接）")
+        print("   5. 把 cURL 粘到模板的 curl_commands 对应字段")
+        return
+
+    # ── 3. 验证必填字段 ──
+    if not cookie:
+        print("[BuildConfig] ❌ 缺少 cookie（在 JSON 'cookie' / cURL -H cookie / --cookie 参数）")
+        return
+    if not preview_url:
+        print("[BuildConfig] ❌ 缺少 preview URL（从 cURL URL 或 --preview-url 获取）")
+        return
+    if not authorization:
+        print("[BuildConfig] ⚠️  未提供 Authorization（建议补上 Bearer token，否则可能被 1001 拒）")
+    if not product_id:
+        print("[BuildConfig] ⚠️  未提供 productId（POST body 会被构造为 {}，可能被服务器拒）")
+
+    # ── 4. 构造 POST body ──
+    if product_id:
+        post_body = json.dumps({"productId": product_id}, separators=(",", ":"))
+    else:
+        post_body = "{}"
+
+    # ── 5. 构造 endpoints dict（结构与 APIInterceptor 捕获的一致） ──
+    endpoints = {
+        "preview": {
+            "url": preview_url,
+            "method": "POST",
+            "headers": {},
+            "post_data": post_body,
+        },
+    }
+    if check_url:
+        endpoints["check"] = {
+            "url": check_url,
+            "method": "POST",
+            "headers": {},
+            "post_data": post_body,
+        }
+    if pay_url:
+        endpoints["pay"] = {
+            "url": pay_url,
+            "method": "POST",
+            "headers": {},
+            "post_data": post_body,
+        }
+
+    # ── 6. 构造 plan_post_bodies（所有变体共用一个 productId） ──
+    plan_post_bodies = {plan_key: post_body for plan_key in PLANS.keys()}
+
+    # ── 7. 构造完整 config（与 APIInterceptor.export_config() 同结构） ──
+    config = {
+        "cookies": {},
+        "cookie_header": cookie,
+        "endpoints": endpoints,
+        "all_requests": [],
+        "detected_plan": plan,
+        "target_plan": plan,
+        "plan_metadata": {
+            f"{plan}__productId": product_id,
+            "productId": product_id,
+        },
+        "plan_post_bodies": plan_post_bodies,
+        "authorization": authorization,
+    }
+
+    # ── 8. 保存 ──
+    save_config(config)
+
+    # ── 9. 打印摘要 + 下一步 ──
+    print()
+    print(f"✅ 配置已构建并保存到 {CONFIG_FILE}")
+    print()
+    print("📊 配置摘要:")
+    print(f"  - 目标套餐: {PLANS[plan]['name']} ({PLANS[plan]['price']})")
+    print(f"  - Cookie 长度: {len(cookie)} 字符")
+    print(f"  - Authorization: {'✅ 已设置 (' + str(len(authorization)) + ' 字符)' if authorization else '⚠️  未设置'}")
+    print(f"  - productId: {product_id or '⚠️  未设置'}")
+    print(f"  - preview 端点: {'✅ ' + preview_url[-50:] if preview_url else '❌'}")
+    print(f"  - check 端点: {'✅ ' + check_url[-50:] if check_url else '⚠️  将用推断 URL（无 WAF 令牌）'}")
+    print(f"  - pay 端点: {'✅ ' + pay_url[-50:] if pay_url else '⚠️  将用推断 URL（无 WAF 令牌）'}")
+    print()
+    print("🚀 下一步:")
+    print()
+    print("  # 1. 先 dry-run 验证接口（建议 09:59 前测试）")
+    print(f"  python glm_coding_rush.py --mode rush --plan {plan} --dry-run")
+    print()
+    print("  # 2. 如果 dry-run 200，开始正式抢购")
+    print(f"  python glm_coding_rush.py --mode rush --plan {plan}")
+    print()
+    print("  # 3. 或用 full 模式（先 dry-run 验证再等 10:00）")
+    print(f"  python glm_coding_rush.py --mode full --plan {plan}")
+    print()
+    print("⚠️  重要提示:")
+    print("  - decode__1570 WAF 令牌有效期约 5~10 分钟，10:00 之前要重新抓")
+    print("  - 建议在 09:59:30 重新跑本命令一次更新令牌")
+    print("  - 如果 dry-run 405/403 → IP 被封，需换网络（手机 4G 热点）")
+    print("=" * 60)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="智谱 GLM Coding Plan 抢购脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 首次使用：打开浏览器捕获接口和 Cookie（默认 Lite 套餐）
-  python glm_coding_rush.py --mode capture --plan lite
+  # 首次使用：打开浏览器捕获接口和 Cookie（默认个人连续包月 Lite）
+  python glm_coding_rush.py --mode capture --plan monthly_lite
 
-  # 抢夺 Pro 套餐
-  python glm_coding_rush.py --mode capture --plan pro
+  # 抢夺个人连续包月 Pro 套餐
+  python glm_coding_rush.py --mode capture --plan monthly_pro
 
   # 干跑测试（验证 Cookie 和接口是否正常）
-  python glm_coding_rush.py --mode rush --plan lite --dry-run
+  python glm_coding_rush.py --mode rush --plan monthly_lite --dry-run
 
   # 使用已保存的配置直接抢购
-  python glm_coding_rush.py --mode rush --plan lite
+  python glm_coding_rush.py --mode rush --plan monthly_lite
 
   # 完整模式（捕获 → 自动等待 → 抢购）
-  python glm_coding_rush.py --mode full --plan lite
+  python glm_coding_rush.py --mode full --plan monthly_lite
 
   # 自定义并发参数
-  python glm_coding_rush.py --mode rush --plan lite --burst 15 --concurrency 8
+  python glm_coding_rush.py --mode rush --plan monthly_lite --burst 5 --concurrency 3
 
 套餐说明:
-  lite  ¥49/月  - 基础套餐，适合个人开发者 / 小型项目
-  pro   ¥149/月 - 专业套餐，5倍额度 / GLM-5 优先体验
-  max   ¥469/月 - 旗舰套餐，20倍额度 / 最高并发优先级
+  ⭐ 默认目标（连续包月 / 个人订阅，推荐）:
+    monthly_lite  ¥49/月  - 个人连续包月 Lite（基础）
+    monthly_pro   ¥149/月 - 个人连续包月 Pro（5倍额度）
+    monthly_max   ¥469/月 - 个人连续包月 Max（20倍额度）
+
+  兼容旧版（不指定周期，可能误匹配年付/一次性）:
+    lite   ¥49/月  - 基础套餐
+    pro    ¥149/月 - 专业套餐
+    max    ¥469/月 - 旗舰套餐
         """
     )
 
     parser.add_argument(
         "--mode", type=str, default="full",
-        choices=["capture", "rush", "full"],
-        help="运行模式: capture(仅捕获) / rush(仅抢购) / full(捕获+抢购)"
+        choices=["capture", "rush", "full", "build-config"],
+        help=(
+            "运行模式: capture(仅捕获) / rush(仅抢购) / full(捕获+抢购) / "
+            "build-config(手动抓包构造 config.json，绕开 Playwright)"
+        )
     )
     parser.add_argument(
-        "--plan", type=str, default="lite",
-        choices=["lite", "pro", "max"],
-        help="目标套餐: lite(¥49/月) / pro(¥149/月) / max(¥469/月)，默认 lite"
+        "--plan", type=str, default="monthly_lite",
+        choices=["monthly_lite", "monthly_pro", "monthly_max", "lite", "pro", "max"],
+        help=(
+            "目标套餐: monthly_lite(个人连续包月 Lite ¥49/月) / "
+            "monthly_pro(¥149/月) / monthly_max(¥469/月)，默认 monthly_lite；"
+            "lite/pro/max 为兼容旧版（可能误匹配年付/一次性）"
+        )
     )
     parser.add_argument(
         "--cookie", type=str, default="",
         help="Cookie 字符串（rush 模式使用，也可从配置文件中加载）"
     )
     parser.add_argument(
-        "--burst", type=int, default=10,
-        help="极速阶段并发数 (默认 10)"
+        "--burst", type=int, default=3,
+        help="极速阶段并发数 (默认 3，WAF 保护下不要超过 5)"
     )
     parser.add_argument(
-        "--concurrency", type=int, default=5,
-        help="普通阶段并发数 (默认 5)"
+        "--concurrency", type=int, default=2,
+        help="普通阶段并发数 (默认 2)"
     )
     parser.add_argument(
         "--burst-duration", type=float, default=5.0,
@@ -1574,6 +2124,48 @@ def main():
     parser.add_argument(
         "--proxy", type=str, default="",
         help="HTTP 代理地址，如 http://127.0.0.1:7890"
+    )
+
+    # ── build-config 模式专用参数（手动抓包构造 config.json） ──
+    parser.add_argument(
+        "--config-input", type=str, default="",
+        help="(build-config) 从 JSON 文件读取手动抓包数据"
+    )
+    parser.add_argument(
+        "--authorization", type=str, default="",
+        help="(build-config) Authorization Bearer token"
+    )
+    parser.add_argument(
+        "--product-id", type=str, default="",
+        help="(build-config) 套餐的 productId"
+    )
+    parser.add_argument(
+        "--preview-url", type=str, default="",
+        help="(build-config) preview 端点 URL（含 WAF 令牌）"
+    )
+    parser.add_argument(
+        "--check-url", type=str, default="",
+        help="(build-config) check 端点 URL（含 WAF 令牌）"
+    )
+    parser.add_argument(
+        "--pay-url", type=str, default="",
+        help="(build-config) pay 端点 URL（含 WAF 令牌）"
+    )
+    parser.add_argument(
+        "--preview-curl", type=str, default="",
+        help="(build-config) preview 请求的 cURL 命令（从 DevTools 复制）"
+    )
+    parser.add_argument(
+        "--check-curl", type=str, default="",
+        help="(build-config) check 请求的 cURL 命令（从 DevTools 复制）"
+    )
+    parser.add_argument(
+        "--pay-curl", type=str, default="",
+        help="(build-config) pay 请求的 cURL 命令（从 DevTools 复制）"
+    )
+    parser.add_argument(
+        "--print-template", action="store_true",
+        help="(build-config) 打印配置模板到屏幕（不构造配置）"
     )
 
     args = parser.parse_args()
@@ -1641,6 +2233,23 @@ def main():
 
     if args.mode == "full":
         asyncio.run(mode_full(rush_config=rush_config))
+        return
+
+    if args.mode == "build-config":
+        asyncio.run(mode_build_config(
+            config_input=args.config_input,
+            cookie=args.cookie,
+            authorization=args.authorization,
+            product_id=args.product_id,
+            preview_url=args.preview_url,
+            check_url=args.check_url,
+            pay_url=args.pay_url,
+            preview_curl=args.preview_curl,
+            check_curl=args.check_curl,
+            pay_curl=args.pay_curl,
+            plan=args.plan,
+            print_template=args.print_template,
+        ))
         return
 
 
